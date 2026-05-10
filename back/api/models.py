@@ -1,125 +1,122 @@
-from django.db import models
-from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
+import datetime
+from mongoengine import (
+    Document, StringField, EmailField, BooleanField,
+    DateTimeField, ReferenceField, ListField,
+)
 
 
-class UserManager(BaseUserManager):
-    def create_user(self, username, email, password=None, **extra_fields):
-        if not email:
-            raise ValueError('Email is required')
-        email = self.normalize_email(email)
-        user = self.model(username=username, email=email, **extra_fields)
-        user.set_password(password)
-        user.save(using=self._db)
-        return user
+class User(Document):
+    username = StringField(required=True, unique=True, max_length=50)
+    email = EmailField(required=True, unique=True)
+    display_name = StringField(max_length=100, default='')
+    bio = StringField(default='')
+    avatar_url = StringField(default='')   # plain string — URLField rejects ''
+    website = StringField(default='')      # plain string — URLField rejects ''
+    location = StringField(max_length=100, default='')
+    password_hash = StringField(required=True)
+    is_active = BooleanField(default=True)
+    created_at = DateTimeField(default=datetime.datetime.utcnow)
+    updated_at = DateTimeField(default=datetime.datetime.utcnow)
 
-    def create_superuser(self, username, email, password=None, **extra_fields):
-        extra_fields.setdefault('is_staff', True)
-        extra_fields.setdefault('is_superuser', True)
-        return self.create_user(username, email, password, **extra_fields)
+    meta = {'collection': 'users', 'indexes': ['username', 'email']}
 
+    @property
+    def pk(self):
+        return str(self.id)
 
-class User(AbstractBaseUser, PermissionsMixin):
-    """Custom user model stored in MongoDB via djongo."""
-    username = models.CharField(max_length=50, unique=True)
-    email = models.EmailField(unique=True)
-    display_name = models.CharField(max_length=100, blank=True)
-    bio = models.TextField(blank=True)
-    avatar_url = models.URLField(blank=True)
-    website = models.URLField(blank=True)
-    location = models.CharField(max_length=100, blank=True)
-    is_active = models.BooleanField(default=True)
-    is_staff = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    @property
+    def is_authenticated(self):
+        return True
 
-    objects = UserManager()
+    @property
+    def is_anonymous(self):
+        return False
 
-    USERNAME_FIELD = 'username'
-    REQUIRED_FIELDS = ['email']
+    def set_password(self, raw_password):
+        from django.contrib.auth.hashers import make_password
+        self.password_hash = make_password(raw_password)
 
-    class Meta:
-        db_table = 'users'
+    def check_password(self, raw_password):
+        from django.contrib.auth.hashers import check_password
+        return check_password(raw_password, self.password_hash)
+
+    @property
+    def followers_count(self):
+        return Follow.objects(following=self).count()
+
+    @property
+    def following_count(self):
+        return Follow.objects(follower=self).count()
+
+    @property
+    def posts_count(self):
+        return Post.objects(author=self).count()
 
     def __str__(self):
         return self.username
 
-    @property
-    def followers_count(self):
-        return Follow.objects.filter(following=self).count()
+
+class Follow(Document):
+    follower = ReferenceField(User, required=True)
+    following = ReferenceField(User, required=True)
+    created_at = DateTimeField(default=datetime.datetime.utcnow)
+
+    meta = {
+        'collection': 'follows',
+        'indexes': [
+            {'fields': ['follower', 'following'], 'unique': True},
+            'follower', 'following',
+        ],
+    }
+
+
+class Post(Document):
+    author = ReferenceField(User, required=True)
+    content = StringField(required=True, max_length=1000)
+    image_url = StringField(default='')   # plain string for same reason
+    tags = ListField(StringField(), default=list)
+    created_at = DateTimeField(default=datetime.datetime.utcnow)
+    updated_at = DateTimeField(default=datetime.datetime.utcnow)
+
+    meta = {
+        'collection': 'posts',
+        'indexes': ['author', '-created_at'],
+        'ordering': ['-created_at'],
+    }
 
     @property
-    def following_count(self):
-        return Follow.objects.filter(follower=self).count()
-
-    @property
-    def posts_count(self):
-        return Post.objects.filter(author=self).count()
-
-
-class Follow(models.Model):
-    """Follow relationship between users."""
-    follower = models.ForeignKey(User, on_delete=models.CASCADE, related_name='following_set')
-    following = models.ForeignKey(User, on_delete=models.CASCADE, related_name='followers_set')
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = 'follows'
-        unique_together = ('follower', 'following')
-
-    def __str__(self):
-        return f'{self.follower.username} → {self.following.username}'
-
-
-class Post(models.Model):
-    """Social media post."""
-    author = models.ForeignKey(User, on_delete=models.CASCADE, related_name='posts')
-    content = models.TextField(max_length=1000)
-    image_url = models.URLField(blank=True)
-    tags = models.JSONField(default=list)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = 'posts'
-        ordering = ['-created_at']
-
-    def __str__(self):
-        return f'Post by {self.author.username} at {self.created_at}'
+    def pk(self):
+        return str(self.id)
 
     @property
     def likes_count(self):
-        return Like.objects.filter(post=self).count()
+        return Like.objects(post=self).count()
 
     @property
     def comments_count(self):
-        return Comment.objects.filter(post=self).count()
+        return Comment.objects(post=self).count()
 
 
-class Like(models.Model):
-    """Like on a post."""
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='likes')
-    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name='likes')
-    created_at = models.DateTimeField(auto_now_add=True)
+class Like(Document):
+    user = ReferenceField(User, required=True)
+    post = ReferenceField(Post, required=True)
+    created_at = DateTimeField(default=datetime.datetime.utcnow)
 
-    class Meta:
-        db_table = 'likes'
-        unique_together = ('user', 'post')
-
-    def __str__(self):
-        return f'{self.user.username} liked post {self.post.id}'
+    meta = {
+        'collection': 'likes',
+        'indexes': [{'fields': ['user', 'post'], 'unique': True}],
+    }
 
 
-class Comment(models.Model):
-    """Comment on a post."""
-    author = models.ForeignKey(User, on_delete=models.CASCADE, related_name='comments')
-    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name='comments')
-    content = models.TextField(max_length=500)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+class Comment(Document):
+    author = ReferenceField(User, required=True)
+    post = ReferenceField(Post, required=True)
+    content = StringField(required=True, max_length=500)
+    created_at = DateTimeField(default=datetime.datetime.utcnow)
+    updated_at = DateTimeField(default=datetime.datetime.utcnow)
 
-    class Meta:
-        db_table = 'comments'
-        ordering = ['created_at']
-
-    def __str__(self):
-        return f'Comment by {self.author.username} on post {self.post.id}'
+    meta = {
+        'collection': 'comments',
+        'indexes': ['post', 'author'],
+        'ordering': ['created_at'],
+    }

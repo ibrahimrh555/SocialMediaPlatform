@@ -1,77 +1,98 @@
-from rest_framework import status, generics, permissions
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.response import Response
+import datetime
 from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import RefreshToken
-from django.contrib.auth import authenticate
-from django.db.models import Q
+from rest_framework.response import Response
+from rest_framework import status, permissions
+from mongoengine.errors import NotUniqueError, DoesNotExist
+from mongoengine.queryset.visitor import Q
 
 from .models import User, Post, Like, Comment, Follow
-from .serializers import (
-    UserSerializer, UserPublicSerializer, RegisterSerializer,
-    PostSerializer, CommentSerializer, FollowSerializer
-)
+from .serializers import serialize_user, serialize_post, serialize_comment
+from .auth import get_tokens_for_user
 
 
-# ─── Auth ────────────────────────────────────────────────────────────────────
+# ─── Auth ─────────────────────────────────────────────────────────────────────
 
 class RegisterView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        serializer = RegisterSerializer(data=request.data)
-        if serializer.is_valid():
-            user = serializer.save()
-            refresh = RefreshToken.for_user(user)
-            return Response({
-                'user': UserSerializer(user, context={'request': request}).data,
-                'access': str(refresh.access_token),
-                'refresh': str(refresh),
-            }, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        data = request.data
+        username = data.get('username', '').strip()
+        email = data.get('email', '').strip()
+        password = data.get('password', '')
+        password2 = data.get('password2', '')
+        display_name = data.get('display_name', '').strip()
+
+        errors = {}
+        if not username:
+            errors['username'] = 'Required.'
+        if not email:
+            errors['email'] = 'Required.'
+        if not password:
+            errors['password'] = 'Required.'
+        if password != password2:
+            errors['password'] = 'Passwords do not match.'
+        if len(password) < 6:
+            errors['password'] = 'Must be at least 6 characters.'
+        if errors:
+            return Response(errors, status=status.HTTP_400_BAD_REQUEST)
+
+        user = User(username=username, email=email, display_name=display_name)
+        user.set_password(password)
+        try:
+            user.save()
+        except NotUniqueError:
+            return Response({'error': 'Username or email already taken.'}, status=400)
+
+        tokens = get_tokens_for_user(user)
+        return Response({
+            'user': serialize_user(user),
+            **tokens,
+        }, status=status.HTTP_201_CREATED)
 
 
 class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        username = request.data.get('username')
-        password = request.data.get('password')
-        user = authenticate(username=username, password=password)
-        if user:
-            refresh = RefreshToken.for_user(user)
-            return Response({
-                'user': UserSerializer(user, context={'request': request}).data,
-                'access': str(refresh.access_token),
-                'refresh': str(refresh),
-            })
-        return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+        username = request.data.get('username', '').strip()
+        password = request.data.get('password', '')
+        try:
+            user = User.objects.get(username=username)
+        except DoesNotExist:
+            return Response({'error': 'Invalid credentials'}, status=401)
+
+        if not user.check_password(password):
+            return Response({'error': 'Invalid credentials'}, status=401)
+
+        tokens = get_tokens_for_user(user)
+        return Response({'user': serialize_user(user), **tokens})
 
 
 class LogoutView(APIView):
     def post(self, request):
-        try:
-            refresh_token = request.data.get('refresh')
-            token = RefreshToken(refresh_token)
-            token.blacklist()
-        except Exception:
-            pass
+        # JWT is stateless; client discards the token
         return Response({'message': 'Logged out successfully'})
 
 
-# ─── User Profile ─────────────────────────────────────────────────────────────
+# ─── Current User ─────────────────────────────────────────────────────────────
 
 class MeView(APIView):
     def get(self, request):
-        return Response(UserSerializer(request.user, context={'request': request}).data)
+        return Response(serialize_user(request.user))
 
     def patch(self, request):
-        serializer = UserSerializer(request.user, data=request.data, partial=True, context={'request': request})
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        user = request.user
+        allowed = ['display_name', 'bio', 'avatar_url', 'website', 'location']
+        for field in allowed:
+            if field in request.data:
+                setattr(user, field, request.data[field])
+        user.updated_at = datetime.datetime.utcnow()
+        user.save()
+        return Response(serialize_user(user))
 
+
+# ─── User Profiles ─────────────────────────────────────────────────────────────
 
 class UserProfileView(APIView):
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
@@ -79,9 +100,9 @@ class UserProfileView(APIView):
     def get(self, request, username):
         try:
             user = User.objects.get(username=username)
-            return Response(UserPublicSerializer(user, context={'request': request}).data)
-        except User.DoesNotExist:
-            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response(serialize_user(user, request.user, public=True))
+        except DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
 
 
 class UserPostsView(APIView):
@@ -90,10 +111,10 @@ class UserPostsView(APIView):
     def get(self, request, username):
         try:
             user = User.objects.get(username=username)
-            posts = Post.objects.filter(author=user)
-            return Response(PostSerializer(posts, many=True, context={'request': request}).data)
-        except User.DoesNotExist:
-            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        except DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+        posts = Post.objects(author=user).order_by('-created_at')
+        return Response([serialize_post(p, request.user) for p in posts])
 
 
 class UserFollowersView(APIView):
@@ -102,10 +123,11 @@ class UserFollowersView(APIView):
     def get(self, request, username):
         try:
             user = User.objects.get(username=username)
-            followers = User.objects.filter(following_set__following=user)
-            return Response(UserPublicSerializer(followers, many=True, context={'request': request}).data)
-        except User.DoesNotExist:
-            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        except DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+        follows = Follow.objects(following=user).select_related()
+        users = [f.follower for f in follows]
+        return Response([serialize_user(u, request.user, public=True) for u in users])
 
 
 class UserFollowingView(APIView):
@@ -114,160 +136,167 @@ class UserFollowingView(APIView):
     def get(self, request, username):
         try:
             user = User.objects.get(username=username)
-            following = User.objects.filter(followers_set__follower=user)
-            return Response(UserPublicSerializer(following, many=True, context={'request': request}).data)
-        except User.DoesNotExist:
-            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        except DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+        follows = Follow.objects(follower=user).select_related()
+        users = [f.following for f in follows]
+        return Response([serialize_user(u, request.user, public=True) for u in users])
 
 
-# ─── Follow System ────────────────────────────────────────────────────────────
+# ─── Follow ────────────────────────────────────────────────────────────────────
 
 class FollowToggleView(APIView):
     def post(self, request, username):
         try:
             target = User.objects.get(username=username)
-        except User.DoesNotExist:
-            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        except DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
 
-        if target == request.user:
-            return Response({'error': 'Cannot follow yourself'}, status=status.HTTP_400_BAD_REQUEST)
+        if str(target.id) == str(request.user.id):
+            return Response({'error': 'Cannot follow yourself'}, status=400)
 
-        follow, created = Follow.objects.get_or_create(follower=request.user, following=target)
-        if not created:
-            follow.delete()
+        existing = Follow.objects(follower=request.user, following=target).first()
+        if existing:
+            existing.delete()
             return Response({'following': False, 'followers_count': target.followers_count})
-        return Response({'following': True, 'followers_count': target.followers_count})
+        else:
+            Follow(follower=request.user, following=target).save()
+            return Response({'following': True, 'followers_count': target.followers_count})
 
 
-# ─── Posts ────────────────────────────────────────────────────────────────────
+# ─── Posts ─────────────────────────────────────────────────────────────────────
 
 class FeedView(APIView):
     def get(self, request):
-        """Get posts from users the current user follows, plus own posts."""
-        following_ids = Follow.objects.filter(
-            follower=request.user
-        ).values_list('following_id', flat=True)
-
-        posts = Post.objects.filter(
-            Q(author_id__in=following_ids) | Q(author=request.user)
-        ).select_related('author')
-
-        return Response(PostSerializer(posts, many=True, context={'request': request}).data)
+        following_ids = [f.following.id for f in Follow.objects(follower=request.user).only('following')]
+        following_ids.append(request.user.id)
+        posts = Post.objects(author__in=following_ids).order_by('-created_at')
+        return Response([serialize_post(p, request.user) for p in posts])
 
 
 class ExploreView(APIView):
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
 
     def get(self, request):
-        """Get all posts for explore page."""
-        posts = Post.objects.all().select_related('author')
-        return Response(PostSerializer(posts, many=True, context={'request': request}).data)
+        posts = Post.objects.order_by('-created_at').limit(50)
+        return Response([serialize_post(p, request.user if request.user.is_authenticated else None) for p in posts])
 
 
 class PostListCreateView(APIView):
     def get(self, request):
-        posts = Post.objects.filter(author=request.user)
-        return Response(PostSerializer(posts, many=True, context={'request': request}).data)
+        posts = Post.objects(author=request.user).order_by('-created_at')
+        return Response([serialize_post(p, request.user) for p in posts])
 
     def post(self, request):
-        serializer = PostSerializer(data=request.data, context={'request': request})
-        if serializer.is_valid():
-            serializer.save(author=request.user)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        content = request.data.get('content', '').strip()
+        if not content:
+            return Response({'content': 'Required.'}, status=400)
+        post = Post(
+            author=request.user,
+            content=content,
+            image_url=request.data.get('image_url', ''),
+            tags=request.data.get('tags', []),
+        )
+        post.save()
+        return Response(serialize_post(post, request.user), status=201)
 
 
 class PostDetailView(APIView):
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
 
-    def get_object(self, pk):
+    def get_post(self, pk):
         try:
-            return Post.objects.get(pk=pk)
-        except Post.DoesNotExist:
+            return Post.objects.get(id=pk)
+        except (DoesNotExist, Exception):
             return None
 
     def get(self, request, pk):
-        post = self.get_object(pk)
+        post = self.get_post(pk)
         if not post:
-            return Response({'error': 'Post not found'}, status=status.HTTP_404_NOT_FOUND)
-        return Response(PostSerializer(post, context={'request': request}).data)
+            return Response({'error': 'Not found'}, status=404)
+        return Response(serialize_post(post, request.user if request.user.is_authenticated else None))
 
     def patch(self, request, pk):
-        post = self.get_object(pk)
+        post = self.get_post(pk)
         if not post:
-            return Response({'error': 'Post not found'}, status=status.HTTP_404_NOT_FOUND)
-        if post.author != request.user:
-            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
-        serializer = PostSerializer(post, data=request.data, partial=True, context={'request': request})
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': 'Not found'}, status=404)
+        if str(post.author.id) != str(request.user.id):
+            return Response({'error': 'Permission denied'}, status=403)
+        for field in ['content', 'image_url', 'tags']:
+            if field in request.data:
+                setattr(post, field, request.data[field])
+        post.updated_at = datetime.datetime.utcnow()
+        post.save()
+        return Response(serialize_post(post, request.user))
 
     def delete(self, request, pk):
-        post = self.get_object(pk)
+        post = self.get_post(pk)
         if not post:
-            return Response({'error': 'Post not found'}, status=status.HTTP_404_NOT_FOUND)
-        if post.author != request.user:
-            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+            return Response({'error': 'Not found'}, status=404)
+        if str(post.author.id) != str(request.user.id):
+            return Response({'error': 'Permission denied'}, status=403)
+        Like.objects(post=post).delete()
+        Comment.objects(post=post).delete()
         post.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(status=204)
 
 
-# ─── Likes ────────────────────────────────────────────────────────────────────
+# ─── Likes ─────────────────────────────────────────────────────────────────────
 
 class LikeToggleView(APIView):
     def post(self, request, pk):
         try:
-            post = Post.objects.get(pk=pk)
-        except Post.DoesNotExist:
-            return Response({'error': 'Post not found'}, status=status.HTTP_404_NOT_FOUND)
+            post = Post.objects.get(id=pk)
+        except (DoesNotExist, Exception):
+            return Response({'error': 'Not found'}, status=404)
 
-        like, created = Like.objects.get_or_create(user=request.user, post=post)
-        if not created:
-            like.delete()
+        existing = Like.objects(user=request.user, post=post).first()
+        if existing:
+            existing.delete()
             return Response({'liked': False, 'likes_count': post.likes_count})
+        Like(user=request.user, post=post).save()
         return Response({'liked': True, 'likes_count': post.likes_count})
 
 
-# ─── Comments ────────────────────────────────────────────────────────────────
+# ─── Comments ──────────────────────────────────────────────────────────────────
 
 class CommentListCreateView(APIView):
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
 
     def get(self, request, pk):
         try:
-            post = Post.objects.get(pk=pk)
-        except Post.DoesNotExist:
-            return Response({'error': 'Post not found'}, status=status.HTTP_404_NOT_FOUND)
-        comments = post.comments.all().select_related('author')
-        return Response(CommentSerializer(comments, many=True, context={'request': request}).data)
+            post = Post.objects.get(id=pk)
+        except (DoesNotExist, Exception):
+            return Response({'error': 'Not found'}, status=404)
+        comments = Comment.objects(post=post).order_by('created_at')
+        return Response([serialize_comment(c, request.user if request.user.is_authenticated else None) for c in comments])
 
     def post(self, request, pk):
         try:
-            post = Post.objects.get(pk=pk)
-        except Post.DoesNotExist:
-            return Response({'error': 'Post not found'}, status=status.HTTP_404_NOT_FOUND)
-        serializer = CommentSerializer(data={**request.data, 'post': post.id}, context={'request': request})
-        if serializer.is_valid():
-            serializer.save(author=request.user)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            post = Post.objects.get(id=pk)
+        except (DoesNotExist, Exception):
+            return Response({'error': 'Not found'}, status=404)
+        content = request.data.get('content', '').strip()
+        if not content:
+            return Response({'content': 'Required.'}, status=400)
+        comment = Comment(author=request.user, post=post, content=content)
+        comment.save()
+        return Response(serialize_comment(comment, request.user), status=201)
 
 
 class CommentDetailView(APIView):
     def delete(self, request, pk, comment_pk):
         try:
-            comment = Comment.objects.get(pk=comment_pk, post_id=pk)
-        except Comment.DoesNotExist:
-            return Response({'error': 'Comment not found'}, status=status.HTTP_404_NOT_FOUND)
-        if comment.author != request.user:
-            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+            comment = Comment.objects.get(id=comment_pk, post=pk)
+        except (DoesNotExist, Exception):
+            return Response({'error': 'Not found'}, status=404)
+        if str(comment.author.id) != str(request.user.id):
+            return Response({'error': 'Permission denied'}, status=403)
         comment.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(status=204)
 
 
-# ─── Search ───────────────────────────────────────────────────────────────────
+# ─── Search ────────────────────────────────────────────────────────────────────
 
 class SearchView(APIView):
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
@@ -277,30 +306,24 @@ class SearchView(APIView):
         if not q:
             return Response({'users': [], 'posts': []})
 
-        users = User.objects.filter(
+        users = User.objects(
             Q(username__icontains=q) | Q(display_name__icontains=q)
-        )[:10]
+        ).limit(10)
 
-        posts = Post.objects.filter(
-            Q(content__icontains=q)
-        ).select_related('author')[:20]
+        posts = Post.objects(content__icontains=q).order_by('-created_at').limit(20)
 
+        req_user = request.user if request.user.is_authenticated else None
         return Response({
-            'users': UserPublicSerializer(users, many=True, context={'request': request}).data,
-            'posts': PostSerializer(posts, many=True, context={'request': request}).data,
+            'users': [serialize_user(u, req_user, public=True) for u in users],
+            'posts': [serialize_post(p, req_user) for p in posts],
         })
 
 
-# ─── Suggested Users ─────────────────────────────────────────────────────────
+# ─── Suggested Users ───────────────────────────────────────────────────────────
 
 class SuggestedUsersView(APIView):
     def get(self, request):
-        following_ids = Follow.objects.filter(
-            follower=request.user
-        ).values_list('following_id', flat=True)
-
-        suggested = User.objects.exclude(
-            id__in=list(following_ids)
-        ).exclude(id=request.user.id)[:6]
-
-        return Response(UserPublicSerializer(suggested, many=True, context={'request': request}).data)
+        following_ids = [f.following.id for f in Follow.objects(follower=request.user).only('following')]
+        following_ids.append(request.user.id)
+        suggested = User.objects(id__nin=following_ids).limit(6)
+        return Response([serialize_user(u, request.user, public=True) for u in suggested])

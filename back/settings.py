@@ -1,9 +1,9 @@
 """
-Django settings for social media app with MongoDB backend.
+Django settings for social media app.
+Uses mongoengine (PyMongo) for MongoDB — no djongo needed.
 """
 from pathlib import Path
-from datetime import timedelta
-import os
+import mongoengine
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -12,10 +12,10 @@ DEBUG = True
 ALLOWED_HOSTS = ['*']
 
 INSTALLED_APPS = [
-    'django.contrib.contenttypes',
+    'django.contrib.auth',          # required by DRF for AnonymousUser
+    'django.contrib.contenttypes',  # required by django.contrib.auth
     'django.contrib.staticfiles',
     'rest_framework',
-    'rest_framework_simplejwt',
     'corsheaders',
     'api',
 ]
@@ -28,30 +28,27 @@ MIDDLEWARE = [
 
 ROOT_URLCONF = 'urls'
 
+# SQLite only for Django internals (auth tables etc.) — all app data is in MongoDB
 DATABASES = {
     'default': {
-        'ENGINE': 'djongo',
-        'NAME': 'socialapp',
-        'ENFORCE_SCHEMA': False,
-        'CLIENT': {
-            'host': 'mongodb://localhost:27017',
-        }
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
     }
 }
 
+# Connect to MongoDB via mongoengine
+MONGO_URI = 'mongodb://localhost:27017/socialapp'
+mongoengine.connect(host=MONGO_URI)
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'api.auth.MongoJWTAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
-}
-
-SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=7),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
-    'AUTH_HEADER_TYPES': ('Bearer',),
+    # Use DRF's built-in AnonymousUser (doesn't need a DB)
+    'UNAUTHENTICATED_USER': None,
 }
 
 CORS_ALLOW_ALL_ORIGINS = True
