@@ -1,4 +1,5 @@
 import { useState, useEffect, createContext, useContext } from "react";
+import LandingPage from './LandingPage';
 
 // ─── API ─────────────────────────────────────────────────────────────────────
 
@@ -1069,9 +1070,12 @@ export default function App() {
 
 function AppContent() {
   const { user, loading } = useAuth();
+  const [showAuth, setShowAuth] = useState(false);   // ← ajoute useState
+
   if (loading) {
     return (
-      <div style={{ minHeight: "100vh", background: "#0a0a0f", display: "flex", alignItems: "center", justifyContent: "center", color: "#666", fontFamily: "'DM Sans', sans-serif" }}>
+      <div style={{ minHeight: "100vh", background: "#0a0a0f", display: "flex",
+        alignItems: "center", justifyContent: "center", color: "#666" }}>
         <div style={{ textAlign: "center" }}>
           <div style={{ fontSize: 40, marginBottom: 16 }}>✦</div>
           <div>Loading Pulse…</div>
@@ -1079,5 +1083,10 @@ function AppContent() {
       </div>
     );
   }
-  return user ? <AppShell /> : <AuthScreen />;
+
+  if (user) return <AppShell />;
+
+  // Affiche la landing page d'abord, l'auth ensuite
+  if (showAuth) return <AuthScreen />;
+  return <LandingPage onGetStarted={() => setShowAuth(true)} />;
 }
